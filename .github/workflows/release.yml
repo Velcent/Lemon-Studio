@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Nama tag untuk rilis (contoh: v1.0.0). Kosongkan jika ingin menggunakan commit hash.'
+        required: false
+        default: ''
 
 concurrency:
   group: release-${{ github.ref }}
@@ -14,16 +19,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-windows:
+  build:
     name: Build Windows x64
     runs-on: windows-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      # Catatan: Runner windows-latest di GitHub Actions sudah menyertakan LLVM (libclang)
-      # yang dibutuhkan untuk generate bindings time stretcher saat build.
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -34,7 +35,6 @@ jobs:
       - name: Build Lemon Studio (os-app)
         run: cargo build -p os-app --release --locked
 
-      # Build VST3 dan CLAP plugins bawaan Lemon Studio
       - name: Bundle Plugins
         run: cargo run -p bundle-plugins --release --locked
 
@@ -59,21 +59,30 @@ jobs:
       - name: Compress Release Archive
         shell: pwsh
         run: |
-          Compress-Archive -Path "release/*" -DestinationPath "Lemon-Studio-windows-x64.zip"
+          Compress-Archive -Path "release\*" -DestinationPath "Lemon-Studio-windows-x64.zip"
 
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Lemon-Studio-windows-x64-zip
+          name: Lemon-Studio-windows-x64
           path: Lemon-Studio-windows-x64.zip
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
         with:
-          files: Lemon-Studio-windows-x64.zip
-          draft: false
-          prerelease: false
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Release ${{ inputs.tag || github.ref_name }}
+          draft: true
           generate_release_notes: true
+          files: dist/*
