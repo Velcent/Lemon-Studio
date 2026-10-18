@@ -43,15 +43,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path release
           
-          # Salin executable utama
           Copy-Item "target/release/lemonstudio.exe" -Destination "release/"
           
-          # Salin file lisensi dan dokumentasi
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "release/" }
           if (Test-Path "README.md") { Copy-Item "README.md" -Destination "release/" }
           if (Test-Path "THIRD-PARTY-NOTICES.txt") { Copy-Item "THIRD-PARTY-NOTICES.txt" -Destination "release/" }
           
-          # Salin plugin bawaan yang sudah di-build (VST3 dan CLAP)
           if (Test-Path "target/bundled") {
             Copy-Item -Path "target/bundled/*" -Destination "release/" -Recurse -Force -ErrorAction SilentlyContinue
           }
@@ -71,6 +68,8 @@ jobs:
     name: Publish Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # <-- INI ADALAH PERBAIKAN UTAMA (Memberi izin menulis ke Release/Tag)
     steps:
       - name: Download Artifact
         uses: actions/download-artifact@v4
