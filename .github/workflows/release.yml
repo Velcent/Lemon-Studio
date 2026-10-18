@@ -1,0 +1,79 @@
+name: Release Windows x64
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Catatan: Runner windows-latest di GitHub Actions sudah menyertakan LLVM (libclang)
+      # yang dibutuhkan untuk generate bindings time stretcher saat build.
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Lemon Studio (os-app)
+        run: cargo build -p os-app --release --locked
+
+      # Build VST3 dan CLAP plugins bawaan Lemon Studio
+      - name: Bundle Plugins
+        run: cargo run -p bundle-plugins --release --locked
+
+      - name: Prepare Release Directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+          
+          # Salin executable utama
+          Copy-Item "target/release/lemonstudio.exe" -Destination "release/"
+          
+          # Salin file lisensi dan dokumentasi
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "release/" }
+          if (Test-Path "README.md") { Copy-Item "README.md" -Destination "release/" }
+          if (Test-Path "THIRD-PARTY-NOTICES.txt") { Copy-Item "THIRD-PARTY-NOTICES.txt" -Destination "release/" }
+          
+          # Salin plugin bawaan yang sudah di-build (VST3 dan CLAP)
+          if (Test-Path "target/bundled") {
+            Copy-Item -Path "target/bundled/*" -Destination "release/" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Compress Release Archive
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "release/*" -DestinationPath "Lemon-Studio-windows-x64.zip"
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lemon-Studio-windows-x64-zip
+          path: Lemon-Studio-windows-x64.zip
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: Lemon-Studio-windows-x64.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
