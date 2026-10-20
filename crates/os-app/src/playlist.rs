@@ -297,6 +297,8 @@ pub enum Cmd {
     Browser(crate::browser::BCmd),
     /// Plugin menus (spec: ui/plugin-menu.md).
     Plugin(crate::plugin_menu::PlugCmd),
+    /// The project picker (spec: ui/project-picker.md).
+    Project(crate::project_picker::ProjCmd),
     /// Channel rack menus (spec: ui/channel-rack.md §17-21).
     Rack(crate::rack::RCmd),
     /// Mixer menus (spec: ui/mixer.md §6-7).
@@ -319,6 +321,14 @@ pub enum Cmd {
     Cpu(crate::cpu::CpuCmd),
     /// The metronome button's menu: the click sound (spec: ui/metronome.md §2).
     MetronomeSound(os_engine::metronome::Sound),
+    /// The Record button's menu checks (spec: ui/recording.md §2).
+    Record(crate::record::Opt),
+    /// Recording precount's length in bars (spec: ui/recording.md §3).
+    RecPrecountBars(u32),
+    /// One-click audio recording's input (spec: ui/one-click-recording.md §2).
+    OneClick(crate::capture::Input),
+    /// The record popups: what to record, the metronome menu's precount, the score logger (spec: ui/recording.md).
+    Rec(crate::record::RecCmd),
     /// Settings > Project ▸ Numerator / Denominator: the project's bar, beats per bar and steps per beat (events 17,
     /// 18; spec: ui/settings-choices.md "Project").
     Bar(u16, u16),
@@ -519,6 +529,8 @@ pub struct PlaylistState {
     pub last_header: Option<(u16, std::time::Instant)>,
     /// Last left click on an audio clip (clip, time): a second one soon after opens its sampler.
     pub last_clip: Option<(usize, std::time::Instant)>,
+    /// Last left click in the ruler: a second one soon after clears the time selection.
+    pub last_ruler: Option<std::time::Instant>,
     /// Waveform cache by sample path (`None` = could not be loaded).
     pub waves: RefCell<HashMap<String, Option<Rc<Wave>>>>,
     /// Tones of the same samples for colourful waveforms, analysed when first needed (`tones`).
@@ -555,6 +567,7 @@ impl Default for PlaylistState {
             row_h: ROW_H,
             last_header: None,
             last_clip: None,
+            last_ruler: None,
             waves: RefCell::new(HashMap::new()),
             tones: RefCell::new(HashMap::new()),
             wave_wait: false,
@@ -1841,8 +1854,13 @@ pub fn add_clip_channel(s: &mut State, kind: ChannelKind) -> usize {
 /// Add an audio clip channel for a sample file and place it at `tick` on `track` (§9). The channel's colour comes from
 /// `State::clip_colors`.
 pub fn add_audio_clip(s: &mut State, path: &str, track: u16, tick: u32) -> Option<usize> {
+    add_audio_clip_as(s, path, track, tick, "Playlist edit")
+}
+
+/// `add_audio_clip` as the undo step `name` (One-click audio recording's "Recorded items").
+pub fn add_audio_clip_as(s: &mut State, path: &str, track: u16, tick: u32, name: &'static str) -> Option<usize> {
     s.playlist.wave(path)?;
-    snapshot(s);
+    snapshot_as(s, name);
     let index = s.project.channels.iter().map(|c| c.index + 1).max().unwrap_or(0);
     let name = std::path::Path::new(path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Audio".into());
     let mixer_track = (s.project.channels.iter().map(|c| c.mixer_track).max().unwrap_or(0) + 1).min(crate::mixer::max_insert(&s.project));
@@ -3213,8 +3231,16 @@ pub fn press_ruler(app: &mut App, grid: Rect, right: bool) {
     let t = snap_round(s, &g, g.tick_at(x), alt);
     if right {
         s.playlist.range = None;
+        s.playlist.last_ruler = None;
         app.drag = Some(Drag::Pl(PlDrag::TimeSel { t0: t }));
     } else {
+        // A double click clears the time selection (a Lemon Studio choice, besides FL's right click).
+        let now = std::time::Instant::now();
+        let double = s.playlist.last_ruler.is_some_and(|t| now.duration_since(t).as_millis() < 450);
+        s.playlist.last_ruler = (!double).then_some(now);
+        if double {
+            s.playlist.range = None;
+        }
         s.playlist.pos = snap_down(s, &g, g.tick_at(x), alt);
         // Moving the song position switches to SONG mode; a time selection does not (§7). The initial values follow
         // (spec: ui/settings-choices.md "Advanced: Initialize controls automatically").
@@ -3372,6 +3398,7 @@ pub fn run(app: &mut App, cmd: Cmd) -> Option<String> {
     match cmd {
         Cmd::Browser(b) => return app.browser_cmd(b),
         Cmd::Plugin(c) => return crate::plugin_menu::run(app, c),
+        Cmd::Project(c) => return crate::project_picker::run(app, c),
         Cmd::Rack(c) => return crate::rack::run(app, c),
         Cmd::Mixer(c) => return crate::mixer::run(app, c),
         Cmd::Param(c) => return app.params_cmd(c),
@@ -3430,6 +3457,21 @@ pub fn run(app: &mut App, cmd: Cmd) -> Option<String> {
             return Some(crate::messages::pick(p));
         }
         Cmd::DataFolder(c) => return app.data_folder_cmd(c),
+        Cmd::Record(o) => {
+            o.toggle();
+            app.invalidate();
+            return None;
+        }
+        Cmd::OneClick(input) => {
+            app.one_click_start(input);
+            return None;
+        }
+        Cmd::Rec(c) => return app.rec_cmd(c),
+        Cmd::RecPrecountBars(bars) => {
+            crate::record::set_precount_bars(bars);
+            app.invalidate();
+            return None;
+        }
         Cmd::MetronomeSound(sound) => {
             crate::metronome::set_sound(sound);
             app.invalidate();
@@ -3489,7 +3531,7 @@ pub fn run(app: &mut App, cmd: Cmd) -> Option<String> {
     let grid_w = grid.map_or(1400.0, |g| g.w);
     let grid_wh = grid.map_or((1400.0, 800.0), |g| (g.w, g.h));
     let msg = match cmd {
-        Cmd::Nothing | Cmd::Pick(..) | Cmd::Browser(_) | Cmd::Plugin(_) | Cmd::Rack(_) | Cmd::Mixer(_) | Cmd::Param(_) | Cmd::Preset(_) | Cmd::Misc(..) | Cmd::PluginDetach(..) | Cmd::Piano(_) | Cmd::Audio(_) | Cmd::Cpu(_) | Cmd::MetronomeSound(_) | Cmd::ContinuousScrolling | Cmd::Pattern(_) | Cmd::ClockMode(_) | Cmd::ClockBeat(_) | Cmd::Toolbar(_) | Cmd::TimeSig(..) | Cmd::Bar(..) | Cmd::PanningLaw(_) | Cmd::TimeMode(_) | Cmd::Timebase(_) => None,
+        Cmd::Nothing | Cmd::Pick(..) | Cmd::Browser(_) | Cmd::Plugin(_) | Cmd::Project(_) | Cmd::Rack(_) | Cmd::Mixer(_) | Cmd::Param(_) | Cmd::Preset(_) | Cmd::Misc(..) | Cmd::PluginDetach(..) | Cmd::Piano(_) | Cmd::Audio(_) | Cmd::Cpu(_) | Cmd::MetronomeSound(_) | Cmd::Record(_) | Cmd::RecPrecountBars(_) | Cmd::OneClick(_) | Cmd::Rec(_) | Cmd::ContinuousScrolling | Cmd::Pattern(_) | Cmd::ClockMode(_) | Cmd::ClockBeat(_) | Cmd::Toolbar(_) | Cmd::TimeSig(..) | Cmd::Bar(..) | Cmd::PanningLaw(_) | Cmd::TimeMode(_) | Cmd::Timebase(_) => None,
         Cmd::NotYet(name) => Some(format!("{name}: not available yet")),
         Cmd::Tool(t) => {
             s.playlist.tool = t;

@@ -88,7 +88,7 @@ Where Lemon Studio stands against what a complete DAW offers:
 | Platforms | 🚧 | Windows 10 / 11, Linux (X11, and Wayland through XWayland) and macOS 11 or newer; macOS is supported at the same level as Linux |
 | Look and themes | 🚧 | Lemon and Classic designs, theme files for Classic; Lemon plugin editors in the Lemon design only |
 | Settings | 🚧 | The General, Audio, File, Theme, Project and Info pages work; not yet the MIDI page or the recording settings |
-| Audio recording | ❌ | |
+| Audio recording | 🚧 | One-click audio recording into the playlist, from ASIO or system inputs |
 | MIDI file import / export | ❌ | |
 | Audio editing | ❌ | |
 | Plugin delay compensation | ❌ | |
@@ -288,7 +288,14 @@ Open a project directly by passing its path:
 cargo run -p os-app --release -- path/to/project.flp
 ```
 
-Use `FILE > Export as WAV` (Ctrl+R) to render the song, or the current pattern in PAT mode, to a file.
+Use `FILE > Export as WAV` (Ctrl+R) to render the song, or the current pattern in PAT mode, to a file. The same
+render runs without a window, hosting the same plugins the app would and without opening an audio device:
+
+```bash
+cargo run -p os-app --release -- --render path/to/project.flp out.wav [--rate 48000] [--seconds 30] [--from TICK] [--builtin-only]
+```
+
+`--builtin-only` hosts only Lemon Studio's own plugins, for a render that is the same on every machine.
 Ctrl+Shift+D switches between the Lemon and Classic designs (the choice is remembered). On macOS, Command stands in for
 Ctrl.
 
@@ -315,7 +322,7 @@ for each of its copyright holders, its SPDX licence identifier and the project's
 | Tool | Purpose |
 |---|---|
 | `flp-dump` | Print a project file's event stream and verify that it round-trips |
-| `os-render` | Render a project or pattern offline to a WAV file |
+| `os-render` | Render a project or pattern offline to a WAV file with the engine alone (no hosted plugins, so it does not sound like the app; `--render` above does) |
 | `os-play` | Play a project through the default audio output |
 | `bundle-plugins` | Build Lemon Studio's own plugins as VST3 and CLAP bundles, and optionally install them (`cargo run -p os-app --release` runs it with `--install`) |
 | `bundle-app` | Build Lemon Studio as a macOS app, and optionally install it |
@@ -351,7 +358,7 @@ Lemon Studio is a Cargo workspace of focused crates:
 The roadmap is kept on the [Lemon Studio Discord server](https://discord.gg/yC2uCuGs3M), where every item is
 marked as complete, in progress or not started. The broad next steps are the engine rework (sampler voice,
 automation, delay compensation), opening projects from older FL Studio versions, audio and note recording, MIDI
-settings, ASIO inputs, more built-in instruments and effects, and the rest of the plugin window features on Linux.
+settings, more built-in instruments and effects, and the rest of the plugin window features on Linux.
 
 ## Development approach
 

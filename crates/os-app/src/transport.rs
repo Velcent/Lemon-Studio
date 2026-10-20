@@ -1,4 +1,5 @@
 // Copyright (C) 2026 ItsAlphaNeon
+// Copyright (C) 2026 thacer13
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
@@ -82,6 +83,8 @@ pub struct Shared {
     generation: AtomicU64,
     /// The running playback is the playlist (else one pattern).
     song: AtomicBool,
+    /// The song's loop points, start << 32 | end in ticks (0 = the whole song): the playlist's time selection.
+    loop_range: AtomicU64,
     /// Playback position in frames of the output stream.
     position: AtomicU64,
     /// Playback position in ticks (f64 bits): what every playhead and the time display show. A pattern wraps.
@@ -266,12 +269,14 @@ pub(crate) struct Starts {
     /// "Reset plugins on transport": the start resets the hosted effects too (their delay lines and tails), not only
     /// the instruments.
     pub(crate) reset: bool,
+    /// Bars of a recording count-in before the position moves (spec: ui/recording.md §3); 0: none.
+    pub(crate) count_in: u32,
 }
 
 impl Starts {
     pub(crate) fn from_prefs() -> Starts {
         use crate::prefs::{check, PLAY_TRUNCATED_ON_TRANSPORT, RESET_PLUGINS_ON_TRANSPORT};
-        Starts { truncated: check(&PLAY_TRUNCATED_ON_TRANSPORT), reset: check(&RESET_PLUGINS_ON_TRANSPORT) }
+        Starts { truncated: check(&PLAY_TRUNCATED_ON_TRANSPORT), reset: check(&RESET_PLUGINS_ON_TRANSPORT), count_in: 0 }
     }
 }
 
@@ -286,6 +291,15 @@ struct Hosts {
 }
 
 type Instruments = Arc<Mutex<Hosts>>;
+
+/// Set by a render without a window (`crate::render`): the audio thread never opens an output device by itself.
+static HEADLESS: AtomicBool = AtomicBool::new(false);
+
+/// No output device opens unless playback asks for one: for renders without a window (`crate::render`). Call before
+/// the first `Transport::new`.
+pub fn headless() {
+    HEADLESS.store(true, Ordering::Release);
+}
 
 pub struct Transport {
     tx: Sender<Cmd>,
@@ -399,6 +413,12 @@ impl Transport {
     /// Start (or restart) playback from `start_tick`; replaces whatever is playing or paused. The transport settings
     /// (`Starts`) are read now.
     pub fn play(&self, project: &Project, mode: PlayMode, start_tick: f64) {
+        self.play_counted(project, mode, start_tick, 0);
+    }
+
+    /// `play`, after a recording count-in of `bars` bars (spec: ui/recording.md §3): the position holds at
+    /// `start_tick` while the metronome counts in.
+    pub fn play_counted(&self, project: &Project, mode: PlayMode, start_tick: f64, bars: u32) {
         if let Ok(mut slot) = self.latest.lock() {
             *slot = None;
         }
@@ -406,7 +426,15 @@ impl Transport {
         self.shared.song.store(matches!(mode, PlayMode::Song), Ordering::Relaxed);
         self.shared.rewind(start_tick);
         self.shared.state.store(PLAYING, Ordering::Release);
-        let _ = self.tx.send(Cmd::Play(Box::new(project.clone()), mode, start_tick, generation, Starts::from_prefs()));
+        let starts = Starts { count_in: bars, ..Starts::from_prefs() };
+        let _ = self.tx.send(Cmd::Play(Box::new(project.clone()), mode, start_tick, generation, starts));
+    }
+
+    /// The song's loop points (the playlist's time selection; `None` = the whole song). Song playback follows them
+    /// from the next tick it renders, also while playing.
+    pub fn set_loop(&self, range: Option<(u32, u32)>) {
+        let packed = range.filter(|&(a, b)| b > a).map_or(0, |(a, b)| u64::from(a) << 32 | u64::from(b));
+        self.shared.loop_range.store(packed, Ordering::Relaxed);
     }
 
     /// Replace the playing project, continuing from the current position.
@@ -615,6 +643,14 @@ impl Transport {
         self.shared.state.store(PLAYING, Ordering::Release);
     }
 
+    /// Shows as playing at `tick` of the pattern (`song` false) or the playlist, without starting anything.
+    #[cfg(test)]
+    pub(crate) fn pretend_at(&self, tick: f64, song: bool) {
+        self.shared.state.store(PLAYING, Ordering::Release);
+        self.shared.song.store(song, Ordering::Relaxed);
+        self.shared.tick.store(tick.to_bits(), Ordering::Relaxed);
+    }
+
     /// Streams open now, fading ones included (each holds its voice counter in `Shared::engine_voices`).
     #[cfg(test)]
     fn streams(&self) -> usize {
@@ -746,6 +782,11 @@ impl Feeder {
         let block = block.max(self.queue.block.load(Ordering::Relaxed)) as u64;
         let want = 2 * (block + margin(block, self.rate));
         let Ok(mut e) = self.engine.lock() else { return };
+        // Song playback loops over the loop points as they are now.
+        if self.ctl.report.load(Ordering::Relaxed) {
+            let r = self.shared.loop_range.load(Ordering::Relaxed);
+            e.set_loop_range((r != 0).then(|| (r >> 32, r & 0xffff_ffff)));
+        }
         // A paused (or stopped) stream renders no more: its fade plays from what is queued, and the engine starts no
         // note that another stream (live notes, an open editor) would then hear ringing at the instruments.
         if self.ctl.paused.load(Ordering::Relaxed) && self.queue.queued() > 0 {
@@ -965,7 +1006,7 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
     let mut lost: Option<Lost> = None;
     // An ASIO driver chosen opens at once (at the start, with new settings), not with the first note: it stays open,
     // and loading it takes a while. When it does not open it is tried again (`ASIO_TRIES`): when, and the tries so far.
-    let mut open_asio = Some((Instant::now(), 0));
+    let mut open_asio = (!HEADLESS.load(Ordering::Acquire)).then(|| (Instant::now(), 0));
     // OS_DEBUG: how far playback renders ahead of the device, every 2 s.
     let debug = std::env::var_os("OS_DEBUG").is_some();
     let mut logged = Instant::now();
@@ -1159,7 +1200,7 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
                 reset_pending = false;
                 listen_retry = true;
                 live_project = Some((*project).clone());
-                let at = At { tick: start, paused: false, truncated: starts.truncated };
+                let at = At { tick: start, paused: false, truncated: starts.truncated, count_in: starts.count_in };
                 match Session::start(&project, mode, Kind::Song, generation, &mut library, shared.clone(), &inst, at, &mut device) {
                     Ok(s) => session = Some(s),
                     Err(e) => {
@@ -1186,7 +1227,7 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
                     (l.next, l.tries) = (Instant::now(), 0);
                 }
                 if let Some(old) = session.take() {
-                    let at = At { tick: f64::from_bits(shared.tick.load(Ordering::Relaxed)), paused: old.paused(), truncated: old.truncated };
+                    let at = At { tick: f64::from_bits(shared.tick.load(Ordering::Relaxed)), paused: old.paused(), truncated: old.truncated, count_in: 0 };
                     let (project, mode, generation) = (old.project.clone(), old.mode, old.generation);
                     drop(old);
                     reset_instruments(&inst);
@@ -1253,7 +1294,7 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
                 // The playback (paused by the app) is held where it was heard; every stream fades out and closes, then
                 // the instruments are reset as after Stop (without the rewind: the transport is paused).
                 if let Some(s) = session.take() {
-                    let at = At { tick: f64::from_bits(shared.tick.load(Ordering::Relaxed)), paused: true, truncated: s.truncated };
+                    let at = At { tick: f64::from_bits(shared.tick.load(Ordering::Relaxed)), paused: true, truncated: s.truncated, count_in: 0 };
                     held = Some((s.project.clone(), s.mode, s.generation, at));
                     retire(s, &mut closing);
                     reset_pending = true;
@@ -1330,7 +1371,7 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
         if lost.is_none() {
             if let Some((name, why)) = device.failure() {
                 if let Some(s) = session.take() {
-                    let at = At { tick: f64::from_bits(shared.tick.load(Ordering::Relaxed)), paused: s.paused(), truncated: s.truncated };
+                    let at = At { tick: f64::from_bits(shared.tick.load(Ordering::Relaxed)), paused: s.paused(), truncated: s.truncated, count_in: 0 };
                     held = Some((s.project.clone(), s.mode, s.generation, at));
                 }
                 live = None;
@@ -1523,6 +1564,8 @@ struct At {
     tick: f64,
     paused: bool,
     truncated: bool,
+    /// Bars of a recording count-in (`Starts::count_in`).
+    count_in: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1605,6 +1648,12 @@ impl Session {
                 let tempo = project.tick_tempo(project.tempo.unwrap_or(140.0));
                 shared.position.store(os_engine::laws::tick_to_frame(at.tick, project.ppq.max(1), tempo, rate), Ordering::Relaxed);
             }
+        }
+        if song && at.count_in > 0 {
+            e.set_count_in(at.count_in);
+        }
+        if song {
+            e.set_run_on(crate::record::run_on_flag());
         }
         let engine = Arc::new(Mutex::new(e));
         let done = Arc::new(AtomicBool::new(false));

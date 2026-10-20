@@ -836,6 +836,9 @@ pub struct Engine {
     /// Audio clips already under way where playback starts, moved to that tick (spec: audio/audio-clips.md,
     /// "Starting inside a clip"), and with `truncated_on_transport` the notes under way there.
     late: Vec<Trigger>,
+    /// A paused playback let go of the audio clips its hosted instruments played (`release_instruments`): resuming
+    /// starts them again where they have got to.
+    relaunch_clips: bool,
     /// "Play truncated notes on transport" (`set_truncated_on_transport`): a seek starts the notes under way.
     truncated_on_transport: bool,
     /// Channel control points in tick order, and the next one to apply.
@@ -852,6 +855,8 @@ pub struct Engine {
     end_tick: u64,
     /// Restart at tick 0 on reaching `end_tick` (pattern playback).
     looping: bool,
+    /// While looping: the playlist's time selection (start, end ticks), played over and over in place of the song.
+    loop_range: Option<(u64, u64)>,
     /// Only live notes, no schedule: finished once everything is silent; the tail rule does not apply.
     live_only: bool,
     /// A live-only engine that never finishes: its hosted instruments are processed every tick, so notes played in
@@ -865,6 +870,13 @@ pub struct Engine {
     fade_out: u32,
     fade_in: u32,
     fade_len: u32,
+    /// A recording count-in (`set_count_in`): ticks of it left, and its length. While it lasts the position holds at the
+    /// start and the metronome counts in (spec: ui/recording.md §3).
+    count_in: u64,
+    count_in_len: u64,
+    /// Recording with Loop record off (`set_run_on`): while the flag is set, a looping playback runs on past its end
+    /// instead of going back to the start (spec: ui/recording.md §4).
+    run_on: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     tempo: f64,
     ppq: u16,
     /// Steps per beat (event 18): the tempo counts beats of this many sixteenths, so the ticks run at `tempo × steps /
@@ -1301,6 +1313,7 @@ impl Engine {
             triggers,
             next_trigger: 0,
             late: Vec::new(),
+            relaunch_clips: false,
             truncated_on_transport: false,
             controls,
             next_ctl: 0,
@@ -1311,10 +1324,14 @@ impl Engine {
             frame: 0,
             end_tick,
             looping: false,
+            loop_range: None,
             live_only: false,
             awake: false,
             tail_done: false,
             held: false,
+            count_in: 0,
+            count_in_len: 0,
+            run_on: None,
             fade_out: 0,
             fade_in: 0,
             fade_len: 0,
@@ -1358,6 +1375,30 @@ impl Engine {
     /// Clicks with `switch` while playing live (spec: ui/metronome.md); an export never does.
     pub fn set_metronome(&mut self, switch: std::sync::Arc<crate::metronome::Switch>) {
         self.metronome = Some(crate::metronome::Metronome::new(switch, self.rate));
+    }
+
+    /// Count in `bars` bars of the time signature's beats before playback moves (spec: ui/recording.md §3): the
+    /// position holds where it is, the metronome clicks every beat whether it is on or off, live notes and the effects
+    /// sound. Needs `set_metronome` for the clicks.
+    pub fn set_count_in(&mut self, bars: u32) {
+        let bar = u64::from(self.beat_ticks()) * u64::from(self.beats_per_accent.max(1));
+        self.count_in = bar * u64::from(bars);
+        self.count_in_len = self.count_in;
+        self.tail_done = false;
+    }
+
+    /// While `flag` is set, a looping playback runs on past its end (spec: ui/recording.md §4); it is read every tick.
+    pub fn set_run_on(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.run_on = Some(flag);
+    }
+
+    /// Ticks of the count-in left to render (0: none, or over).
+    pub fn counting_in(&self) -> u64 {
+        self.count_in
+    }
+
+    fn beat_ticks(&self) -> u32 {
+        (u32::from(self.ppq) * u32::from(self.steps) / 4).max(1)
     }
 
     /// A click from the next tick, for a tap on the Tempo tapper (spec: ui/tempo-tapper.md §8): the metronome's Tick,
@@ -1437,6 +1478,13 @@ impl Engine {
         self.looping = on;
     }
 
+    /// A looping song's loop points (the playlist's time selection, `None` or empty = the whole song): reaching the
+    /// end, playback continues from the start. Played from outside the range, it gets there at the range's end, or
+    /// at the song's end when it started past the range.
+    pub fn set_loop_range(&mut self, range: Option<(u64, u64)>) {
+        self.loop_range = range.filter(|&(a, b)| b > a);
+    }
+
     /// "Play truncated notes on transport" (Settings > Audio > Mixer; spec: ui/settings-choices.md "Transport: Play
     /// truncated notes and Reset plugins"): on, `seek_tick` starts the notes that are under way at the new place
     /// (`notes_under_way`); off (the default), they are skipped and their channels stay silent until their next note.
@@ -1476,6 +1524,11 @@ impl Engine {
         self.fade_in = self.fade_len - self.fade_out.min(self.fade_len);
         self.fade_out = 0;
         self.held = false;
+        if std::mem::take(&mut self.relaunch_clips) {
+            let channels = &self.channels;
+            let clips = self.clips_under_way(self.tick).into_iter().filter(|t| channels.get(t.channel).is_some_and(|c| c.instrument.0.is_some()));
+            self.late.extend(clips);
+        }
     }
 
     /// Paused: the channels are held (or fading out to be).
@@ -1494,6 +1547,7 @@ impl Engine {
     /// notes, an open editor): its held notes would ring there for as long as it is paused.
     pub fn release_instruments(&mut self) {
         self.send_held_offs();
+        self.relaunch_clips |= self.inst_offs.iter().any(|o| o.3.is_some());
         self.inst_offs.clear();
         let channels = &self.channels;
         self.sounding.retain(|&(c, _, _)| channels.get(c).is_none_or(|ch| ch.instrument.0.is_none()));
@@ -1746,6 +1800,7 @@ impl Engine {
     /// the ticks after it.
     pub fn continue_from(&mut self, old: &mut Engine) {
         self.looping = old.looping;
+        self.loop_range = old.loop_range;
         self.truncated_on_transport = old.truncated_on_transport;
         // The metronome carries on, with a click that is sounding (rebuilt at a new rate).
         self.metronome = old.metronome.take().map(|m| if m.rate() == self.rate { m } else { crate::metronome::Metronome::new(m.switch().clone(), self.rate) });
@@ -1810,6 +1865,8 @@ impl Engine {
         self.inst_tail = old.inst_tail;
         self.awake = old.awake;
         (self.held, self.fade_out, self.fade_in, self.fade_len) = (old.held, old.fade_out, old.fade_in, old.fade_len);
+        (self.count_in, self.count_in_len) = (old.count_in, old.count_in_len);
+        self.run_on = old.run_on.take();
         self.inst_offs = std::mem::take(&mut old.inst_offs);
         self.inst_offs.retain(|o| o.1 < n);
         self.inst_shapes = std::mem::take(&mut old.inst_shapes);
@@ -2081,9 +2138,19 @@ impl Engine {
         if self.held {
             return self.render_held();
         }
-        // A looping engine starts again at tick 0 when the pattern is over; voices and effects carry on.
-        if self.looping && self.end_tick > 0 && self.tick >= self.end_tick {
-            self.wrap();
+        if self.count_in > 0 {
+            return self.render_count_in();
+        }
+        // A looping engine starts again at tick 0 when the pattern is over, or at its loop points' start on reaching
+        // their end; voices and effects carry on. Recording with Loop record off, it runs on.
+        let run_on = self.run_on.as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+        if self.looping && !run_on {
+            match self.loop_range.filter(|_| !self.live_only) {
+                Some((a, b)) if self.tick == b => self.wrap_to(a),
+                Some((a, b)) if self.end_tick > 0 && self.tick >= self.end_tick && self.tick > b => self.wrap_to(a),
+                None if self.end_tick > 0 && self.tick >= self.end_tick => self.wrap_to(0),
+                _ => {}
+            }
         }
         let tick = self.tick;
         let (start, len) = self.clock.advance();
@@ -2109,9 +2176,9 @@ impl Engine {
         }
         // The metronome's click enters the master track (spec: ui/metronome.md §4): live playback only, and no new
         // click once a song is over.
+        let beat = self.beat_ticks();
         if let Some(m) = self.metronome.as_mut().filter(|_| !self.exporting && !self.live_only) {
             let start = self.looping || tick < self.end_tick;
-            let beat = (u32::from(self.ppq) * u32::from(self.steps) / 4).max(1);
             m.tick(tick, beat, self.beats_per_accent, start, &mut self.bus[0][..len * 2]);
         }
         if !self.exporting {
@@ -2167,6 +2234,48 @@ impl Engine {
             let limit = (TAIL_LIMIT_SECONDS * f64::from(self.rate) / self.clock.samples_per_tick()) as u64;
             if quiet || tick >= self.end_tick + limit {
                 self.tail_done = true;
+            }
+        }
+    }
+
+    /// A tick of the recording count-in (`set_count_in`): handed out at the held position like a paused tick, but live
+    /// notes and voices still ringing sound, and the metronome counts in.
+    fn render_count_in(&mut self) {
+        // Whole ticks of the count-in's own clock, so its beats fall on time.
+        let done = self.count_in_len - self.count_in;
+        let at = |t: u64| Clock::frame_of_tick(self.rate, self.ppq, self.tick_tempo(), t);
+        let len = (at(done + 1) - at(done)).max(1) as usize;
+        let mut song = self.transport_at(self.frame);
+        song.playing = false;
+        for b in &mut self.bus {
+            b.clear();
+            b.resize(len * 2, 0.0);
+        }
+        let channels = &self.channels;
+        let bus = &mut self.bus;
+        self.voices.retain_mut(|v| render_voice(v, channels, bus, 0, 0, len));
+        self.render_instruments(len, &song);
+        for ch in &mut self.channels {
+            ch.advance(len as u32);
+        }
+        let beat = self.beat_ticks();
+        if let Some(m) = self.metronome.as_mut() {
+            m.count_in(done, beat, self.beats_per_accent, &mut self.bus[0][..len * 2]);
+        }
+        self.count_in -= 1;
+        self.mix(len, &song);
+        self.out.clear();
+        self.out.extend_from_slice(&self.bus[0][..len * 2]);
+        self.out_pos = 0;
+        self.out_tick = self.tick;
+        self.out_frame = self.frame;
+        self.out_held = true;
+        let mut ramp = self.main_glide.block(self.main_gain, len, os_dsp::glide::engine_limit(self.rate));
+        if !(ramp.is_flat() && ramp.first() == 1.0) {
+            for f in self.out.chunks_exact_mut(2) {
+                let g = ramp.next();
+                f[0] *= g;
+                f[1] *= g;
             }
         }
     }
@@ -2695,15 +2804,31 @@ impl Engine {
             denominator: self.signature.1,
             looping: None,
         };
-        if self.looping && self.end_tick > 0 {
-            start.looping = Some((0.0, self.end_tick as f64 / f64::from(self.ppq)));
+        if self.looping {
+            let ppq = f64::from(self.ppq);
+            match self.loop_range {
+                Some((a, b)) => start.looping = Some((a as f64 / ppq, b as f64 / ppq)),
+                None if self.end_tick > 0 => start.looping = Some((0.0, self.end_tick as f64 / ppq)),
+                None => {}
+            }
         }
         start.advanced(frame, self.rate)
     }
 
-    /// Loop point: back to tick 0 (sounding notes keep their remaining length).
-    fn wrap(&mut self) {
-        let at = self.end_tick;
+    /// Loop point: back to tick `to` (sounding notes keep their remaining length). Away from tick 0 it lands as a
+    /// seek does: control points before it applied, audio clips under way started from where they have got to.
+    fn wrap_to(&mut self, to: u64) {
+        let at = self.tick - to;
+        // Audio clips end at the loop point: the replay starts them again (from the top, or where they are under way
+        // at `to`), so one running on past the loop's end would sound twice, and once more every loop.
+        self.voices.retain(|v| v.cut.is_none());
+        // So do audio clips a hosted instrument plays (their end is a choke of that voice).
+        let events = &mut self.inst_events;
+        self.inst_offs.retain(|&(_, ch, key, voice)| {
+            let Some(v) = voice else { return true };
+            events.push(notes::Event { voice: Some(v), ..notes::Event::choke(ch, 0, key) });
+            false
+        });
         for o in &mut self.inst_offs {
             o.0 = o.0.saturating_sub(at);
         }
@@ -2711,17 +2836,28 @@ impl Engine {
             v.cut = v.cut.map(|c| c.saturating_sub(at));
             v.release_at = v.release_at.map(|r| r.saturating_sub(at));
         }
-        self.clock.restart();
-        self.tick = 0;
-        self.frame = 0;
-        self.next_trigger = 0;
+        if to == 0 {
+            self.clock.restart();
+        } else {
+            self.clock = Clock::at_tick(self.rate, self.ppq, self.tick_tempo(), to);
+        }
+        self.tick = to;
+        self.frame = self.clock.next_start();
+        self.next_trigger = self.triggers.partition_point(|t| t.tick < to);
         // Control points replay from the top: until the first one the channel has its own settings, and mixer tracks
         // glide back to theirs until automation hands its values on again (a Lemon Studio choice; FL's behaviour at
         // the loop point is not measured).
         for t in &mut self.tracks {
             t.restore(false);
         }
-        self.sync_controls(0);
+        self.sync_controls(to);
+        if to > 0 {
+            self.late = self.clips_under_way(to);
+            if self.truncated_on_transport {
+                let notes = self.notes_under_way(to);
+                self.late.extend(notes);
+            }
+        }
         for s in &mut self.sounding {
             if s.2 != u64::MAX {
                 s.2 = s.2.saturating_sub(at);
@@ -2729,7 +2865,7 @@ impl Engine {
         }
         self.sounding.retain(|&(_, _, end)| end > 0);
         // A song back at its start: the initial values first, then automation clips act there as usual.
-        if !self.init.is_empty() {
+        if to == 0 && !self.init.is_empty() {
             self.set_auto_values(self.init.clone(), 0);
         }
     }
@@ -2772,7 +2908,14 @@ impl Engine {
     /// A note off to its instrument for every note held there: scheduled notes that have not ended, live notes, and
     /// voices whose notes have not ended.
     fn send_held_offs(&self) {
-        let mut held: Vec<(usize, u8)> = self.inst_offs.iter().map(|&(_, c, key, _)| (c, key)).collect();
+        // Audio clips a hosted instrument plays end with a choke of their voice: a note off would leave a sample
+        // without a volume envelope playing on.
+        for &(_, c, key, voice) in &self.inst_offs {
+            if let (Some(v), Some(Ok(mut inst))) = (voice, self.channels.get(c).and_then(|ch| ch.instrument.0.as_ref()).map(|i| i.lock())) {
+                inst.voice_choke(0, key, v);
+            }
+        }
+        let mut held: Vec<(usize, u8)> = self.inst_offs.iter().filter(|o| o.3.is_none()).map(|&(_, c, key, _)| (c, key)).collect();
         held.extend(self.sounding.iter().filter(|s| s.2 == u64::MAX).map(|&(c, key, _)| (c, key.min(127) as u8)));
         // Voices whose notes have not ended (a mono voice sounds under its first key).
         for (c, v) in self.note_voices.iter().enumerate() {
@@ -4214,6 +4357,67 @@ mod tests {
         assert_eq!(got, vec![(0, "from", 0.25), (f(96.0), "choke", 0.0), (f(384.0), "on", 0.0), (f(480.0), "choke", 0.0)]);
     }
 
+    /// A paused playback whose hosted instruments another stream processes lets go of them: an audio clip's voice is
+    /// choked (a note off leaves a sample without a volume envelope playing on), and resuming starts the clip again
+    /// where the song has got to.
+    // spec: audio/transport.md "Pause"
+    #[test]
+    fn a_released_pause_chokes_hosted_clips_and_resume_starts_them_again() {
+        use os_model::{Clip, ClipSource};
+        #[derive(Default)]
+        struct Log(Vec<(u64, &'static str, f32)>, u64);
+        impl crate::Instrument for Log {
+            fn note_on(&mut self, o: u32, _k: u8, _v: f32) {
+                self.0.push((self.1 + u64::from(o), "on", 0.0));
+            }
+            fn note_off(&mut self, o: u32, _k: u8) {
+                self.0.push((self.1 + u64::from(o), "off", 0.0));
+            }
+            fn note_on_from(&mut self, o: u32, _k: u8, _v: f32, start: f32) {
+                self.0.push((self.1 + u64::from(o), "from", start));
+            }
+            fn choke(&mut self, o: u32, _k: u8) {
+                self.0.push((self.1 + u64::from(o), "choke", 0.0));
+            }
+            fn process(&mut self, _rate: u32, l: &mut [f32], _r: &mut [f32]) {
+                self.1 += l.len() as u64;
+            }
+        }
+        let wav = std::env::temp_dir().join("os-engine-pause-clip.wav");
+        crate::wav::write_f32_stereo(&mut std::fs::File::create(&wav).unwrap(), 48000, &vec![0.25; 4 * 96000]).unwrap();
+        let mut p = song(vec![], vec![Clip::new(0, 384, 0, ClipSource::Channel(0))]);
+        p.channels[0].kind = ChannelKind::AudioClip;
+        p.channels[0].sample_path = Some(wav.to_string_lossy().into_owned());
+        let mut lib = SampleLibrary::new(None);
+        let mut e = Engine::new(&p, &mut lib, 48000, PlayMode::Song);
+        let log = Arc::new(std::sync::Mutex::new(Log::default()));
+        e.set_instrument(0, log.clone());
+        for _ in 0..48 {
+            e.render_tick();
+        }
+        e.pause();
+        for _ in 0..8 {
+            e.render_tick();
+        }
+        assert!(e.paused());
+        e.release_instruments();
+        let names = |l: &Log| l.0.iter().map(|x| x.1).collect::<Vec<_>>();
+        let before = names(&log.lock().unwrap());
+        assert_eq!(before[..2], ["on", "choke"], "the clip is choked (a note off would leave it playing)");
+        let at = e.tick;
+        e.resume();
+        e.render_tick();
+        let l = log.lock().unwrap();
+        assert_eq!(names(&l)[before.len()..], ["from"], "resuming starts the clip again");
+        let start = l.0[before.len()].2;
+        // The 4 s sample, at the song's place (within a few ticks: 5 ms each).
+        let want = at as f32 / 96.0 * 60.0 / 130.0 / 4.0;
+        assert!((start - want).abs() < 0.004, "where the song has got to: {start} vs {want}");
+        drop(l);
+        drop(e);
+        assert!(names(&log.lock().unwrap())[before.len() + 1..].contains(&"choke"), "and is choked again when playback goes");
+    }
+
     // spec: audio/audio-clips.md "Level"
     #[test]
     fn audio_clips_play_at_unity_through_a_default_channel() {
@@ -5443,6 +5647,63 @@ mod tests {
         assert_eq!(e.channels[0].vol_v, 0.5);
     }
 
+    /// A looping song with loop points plays them over and over: from before the range it runs on to the range's end,
+    /// from past it to the song's end, then from the range's start.
+    #[test]
+    fn a_song_loops_over_its_loop_points() {
+        use os_model::{Clip, ClipSource};
+        let p = song(vec![long_note(0, 96, 0)], vec![Clip::new(0, 384, 0, ClipSource::Pattern(1))]);
+        let mut lib = SampleLibrary::new(None);
+        let ticks = |from: u64, n: usize| {
+            let mut e = Engine::new(&p, &mut SampleLibrary::new(None), 48000, PlayMode::Song);
+            e.set_looping(true);
+            e.set_loop_range(Some((96, 192)));
+            e.seek_tick(from);
+            (0..n).map(|_| e.next_tick().unwrap().1).collect::<Vec<_>>()
+        };
+        let from_start = ticks(0, 400);
+        assert_eq!(&from_start[190..194], &[190, 191, 96, 97], "from before the range: back at its end");
+        assert_eq!(from_start[192 + 96], 96, "and again");
+        let past = ticks(300, 90);
+        assert_eq!(&past[82..86], &[382, 383, 96, 97], "from past the range: back at the song's end");
+        // No range (or an empty one): the whole song.
+        let mut e = Engine::new(&p, &mut lib, 48000, PlayMode::Song);
+        e.set_looping(true);
+        e.set_loop_range(Some((96, 96)));
+        let whole: Vec<u64> = (0..386).map(|_| e.next_tick().unwrap().1).collect();
+        assert_eq!(&whole[383..], &[383, 0, 1]);
+    }
+
+    /// An audio clip running on past the loop's end ends there: the replay starts it again, once (it used to sound
+    /// twice, then three times, louder every loop).
+    #[test]
+    fn audio_clips_end_at_the_loop_point() {
+        use os_model::{Clip, ClipSource};
+        let wav = std::env::temp_dir().join("os-engine-loop-clip.wav");
+        crate::wav::write_f32_stereo(&mut std::fs::File::create(&wav).unwrap(), 48000, &vec![0.25; 2 * 48000 * 4]).unwrap();
+        for range in [(0, 192), (96, 192)] {
+            let mut p = song(vec![], vec![Clip::new(0, 384, 0, ClipSource::Channel(0))]);
+            p.channels[0].kind = ChannelKind::AudioClip;
+            p.channels[0].sample_path = Some(wav.to_string_lossy().into_owned());
+            let mut e = Engine::new(&p, &mut SampleLibrary::new(None), 48000, PlayMode::Song);
+            e.set_looping(true);
+            e.set_loop_range(Some(range));
+            let mut peak_first = 0.0f32;
+            let mut peak_later = 0.0f32;
+            for i in 0..1000 {
+                let (s, tick, ..) = e.next_tick().unwrap();
+                let p = s.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                if i < 150 && tick > range.0 + 5 {
+                    peak_first = peak_first.max(p);
+                } else if i > 600 {
+                    peak_later = peak_later.max(p);
+                }
+                assert!(e.voices.iter().filter(|v| v.cut.is_some()).count() <= 1, "{range:?}: one clip voice at tick {tick}");
+            }
+            assert!(peak_first > 0.1 && peak_later < peak_first * 1.1, "{range:?}: {peak_first} then {peak_later}");
+        }
+    }
+
     /// A song that loops sets the project's initial values again at its start, before its automation clips act; a
     /// pattern doesn't (spec: ui/settings-choices.md "Advanced: Initialize controls automatically").
     #[test]
@@ -5722,6 +5983,61 @@ mod tests {
         }
         let accented: Vec<bool> = on.iter().map(|o| o.1 > on[1].1 * 1.3).collect();
         assert_eq!(accented, [true, false, false, true, false, false, true]);
+    }
+
+    // spec: ui/recording.md §3
+    #[test]
+    fn a_count_in_holds_the_position_and_clicks_with_the_metronome_off() {
+        // 3/4, one bar: three clicks (accented, plain, plain) while the position stays at 0, then playback moves on
+        // and, the switch being off, clicks no more.
+        let mut p = project(vec![], vec![]);
+        p.bar = Some((3, 4));
+        p.mixer = (0..2).map(os_model::MixerTrack::new).collect();
+        let mut lib = SampleLibrary::new(None);
+        let rate = 48000;
+        let mut e = Engine::new(&p, &mut lib, rate, PlayMode::Pattern(1));
+        e.set_looping(true);
+        let off = metronome_on();
+        off.set_on(false);
+        e.set_metronome(off);
+        e.set_count_in(1);
+        assert_eq!(e.counting_in(), 3 * 96);
+        let mut out = vec![0.0; 2 * rate as usize];
+        e.process(&mut out);
+        assert_eq!(e.tick_position(), 0.0, "held through the count-in");
+        let mut more = vec![0.0; 2 * rate as usize * 2];
+        e.process(&mut more);
+        out.extend(more);
+        assert_eq!(e.counting_in(), 0);
+        assert!(e.tick_position() > 0.0, "playing again");
+        let on = click_onsets(&out, rate);
+        let beats: Vec<u64> = (0..3).map(|b| crate::clock::Clock::frame_of_tick(rate, 96, 130.0, 96 * b)).collect();
+        assert_eq!(on.len(), 3, "{on:?}");
+        for ((f, _), b) in on.iter().zip(&beats) {
+            assert!(f.abs_diff(*b) <= 3, "{f} vs beat {b}");
+        }
+        assert!(on[0].1 > on[1].1 * 1.3 && on[1].1 < on[2].1 * 1.3);
+    }
+
+    // spec: ui/recording.md §4
+    #[test]
+    fn run_on_plays_past_the_loop_end_while_set() {
+        let mut p = project(vec![], vec![]);
+        p.mixer = (0..2).map(os_model::MixerTrack::new).collect();
+        let mut lib = SampleLibrary::new(None);
+        let mut e = Engine::new(&p, &mut lib, 48000, PlayMode::Pattern(1));
+        e.set_looping(true);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        e.set_run_on(flag.clone());
+        // Three seconds at 130 BPM: past the one-bar pattern's end (1.85 s).
+        let mut out = vec![0.0; 2 * 48000 * 3];
+        e.process(&mut out);
+        assert!(e.tick_position() > 384.0, "ran on: {}", e.tick_position());
+        assert!(!e.finished());
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut out = vec![0.0; 2 * 4800];
+        e.process(&mut out);
+        assert!(e.tick_position() < 384.0, "back to the start: {}", e.tick_position());
     }
 
     #[test]

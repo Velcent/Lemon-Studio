@@ -16,10 +16,11 @@ mod autoscroll;
 mod backup;
 #[cfg(test)]
 mod audio_bench;
-#[cfg(test)]
-mod render_check;
 mod browser;
 mod cable;
+mod capture;
+mod one_click;
+mod score_log;
 mod clip_colors;
 mod clock;
 mod cpu;
@@ -54,6 +55,7 @@ mod piano_snap;
 mod piano_split;
 mod piano_tools;
 mod rack;
+mod render;
 mod patterns;
 mod perf;
 mod playlist;
@@ -70,6 +72,7 @@ mod prefs;
 mod preview_track;
 mod project_forms;
 mod project_info;
+mod project_picker;
 mod project_plugins;
 mod presets;
 mod misc;
@@ -87,6 +90,8 @@ mod splash;
 mod stall;
 mod step_edit;
 mod tapper;
+mod touch;
+mod record;
 mod theme_adjust;
 mod theme_library;
 mod templates;
@@ -675,9 +680,10 @@ impl ApplicationHandler for Shell {
         if matches!(event, WindowEvent::MouseWheel { .. }) && crate::plugin_window::pointer_in_docked() {
             return;
         }
-        // Linux: a click in the main window takes the keyboard back from a plugin editor that holds it (X11 leaves it
-        // there), so the typing keyboard plays again.
-        #[cfg(target_os = "linux")]
+        // Linux and Windows: a click in the main window takes the keyboard back from a plugin editor that holds it (X11
+        // leaves it there, and so does Windows for a docked editor, a child window of this one), so the shortcuts and
+        // the typing keyboard work again (spec: ui/piano-keys.md §4 rule 2).
+        #[cfg(any(target_os = "linux", windows))]
         if matches!(event, WindowEvent::MouseInput { state: ElementState::Pressed, .. }) {
             crate::plugin_window::focus_main();
         }
@@ -856,9 +862,10 @@ impl ApplicationHandler for Shell {
                         return;
                     }
                 }
-                // A dialog takes repeats too (typing, moving through its list), and so does an Info box or a browser
-                // folder cell being edited.
-                if pressed && (!event.repeat || self.app.modal_open() || self.app.info_editing() || self.app.folder_cell_editing() || self.app.name_editing()) {
+                // Repeats go on too: a dialog, an Info box or a browser folder cell takes them (typing, moving through a
+                // list), and `App::key` keeps those of the piano roll's moving and copying keys (spec: ui/piano-keys.md
+                // §4 rule 1).
+                if pressed {
                     // macOS: Option and Command change the character a key types (Option+S is "ß"); shortcuts go by the
                     // key itself.
                     #[cfg(target_os = "macos")]
@@ -892,7 +899,9 @@ impl ApplicationHandler for Shell {
                         }
                         event
                     };
+                    self.app.repeat = event.repeat;
                     self.app.key(&event.logical_key, ctrl(self.mods), self.mods.alt_key());
+                    self.app.repeat = false;
                     window.request_redraw();
                 }
             }
@@ -1137,7 +1146,7 @@ fn screenshot(args: &[String]) {
     let mut plugin_menu: Option<plugin_menu::Target> = None;
     let mut settings: Option<usize> = None;
     let mut info_edit: Option<usize> = None;
-    let mut clicks: Vec<(f32, f32)> = Vec::new();
+    let mut clicks: Vec<(f32, f32, bool)> = Vec::new();
     let mut wheels: Vec<(f32, f32, f32)> = Vec::new();
     let mut lane: Option<usize> = None;
     let mut lane_menu = false;
@@ -1193,11 +1202,13 @@ fn screenshot(args: &[String]) {
                     mouse = Some((x, y));
                 }
             }
-            // Click at x,y (left button) before the frame is captured; may be given more than once, done in order.
-            "--click" => {
+            // Click at x,y (left button; `--rclick`: the right one) before the frame is captured; may be given more than
+            // once, done in order.
+            a @ ("--click" | "--rclick") => {
+                let right = a == "--rclick";
                 let v: Vec<f32> = it.next().map(|v| v.split(',').filter_map(|n| n.parse().ok()).collect()).unwrap_or_default();
                 if let [x, y] = v[..] {
-                    clicks.push((x, y));
+                    clicks.push((x, y, right));
                 }
             }
             // The wheel turned `dy` notches at x,y after the first paint, before the clicks (scrolls a page, e.g.
@@ -1428,9 +1439,13 @@ fn screenshot(args: &[String]) {
         app.wheel(0.0, dy, false, false);
         app.paint(&mut canvas, None);
     }
-    for (x, y) in clicks {
+    for (x, y, right) in clicks {
         app.mouse_move(x, y);
-        app.mouse_down();
+        if right {
+            app.mouse_down_right();
+        } else {
+            app.mouse_down();
+        }
         app.mouse_up();
         app.paint(&mut canvas, None);
     }
@@ -1568,6 +1583,10 @@ fn main() {
         std::process::exit(plugins::window_check::run(&args[1..]));
     }
     app::move_old_settings();
+    // A render without a window (FILE > Export as WAV from the command line, `render`).
+    if args.first().map(String::as_str) == Some("--render") {
+        std::process::exit(render::cli(&args[1..]));
+    }
     if args.iter().any(|a| a == "--screenshot") {
         screenshot(&args);
         return;
