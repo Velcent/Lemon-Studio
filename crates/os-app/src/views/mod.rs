@@ -22,6 +22,8 @@ pub mod project_forms;
 pub mod rack;
 pub mod export_form;
 pub mod save_form;
+pub mod arpeggiate;
+pub mod strum;
 pub mod tapper;
 pub mod touch;
 pub mod theme_preview;
@@ -173,6 +175,8 @@ pub fn paint(ui: &mut Ui, s: &State, f: &FrameInfo) -> usize {
             Win::Perf => ui.part(Seg::Win(win), a, |ui| perf::paint(ui, s, f)),
             Win::Tapper => ui.part(Seg::Win(win), a, |ui| tapper::paint(ui, s, f)),
             Win::Touch => ui.part(Seg::Win(win), a, |ui| touch::paint(ui, s, f)),
+            Win::Strum => ui.part(Seg::Win(win), a, |ui| strum::paint(ui, s, f)),
+            Win::Arp => ui.part(Seg::Win(win), a, |ui| arpeggiate::paint(ui, s, f)),
             _ => {}
         }
         ui.c.pop_clip();
@@ -232,6 +236,8 @@ pub fn paint_area(s: &State, w: Win) -> Rect {
         Win::Perf => perf::bounds(s),
         Win::Tapper => tapper::bounds(s),
         Win::Touch => touch::bounds(s),
+        Win::Strum => strum::bounds(s),
+        Win::Arp => arpeggiate::bounds(s),
         w => s.win_rect(w),
     }
 }

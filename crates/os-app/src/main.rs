@@ -92,6 +92,8 @@ mod song_pos;
 mod splash;
 mod stall;
 mod step_edit;
+mod strum;
+mod arpeggiate;
 mod tapper;
 mod touch;
 mod record;
