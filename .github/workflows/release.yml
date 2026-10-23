@@ -1,0 +1,87 @@
+name: Release Windows x64
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Nama tag untuk rilis (contoh: v1.0.0). Kosongkan jika ingin menggunakan commit hash.'
+        required: false
+        default: ''
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Lemon Studio (os-app)
+        run: cargo build -p os-app --release --locked
+
+      - name: Bundle Plugins
+        run: cargo run -p bundle-plugins --release --locked
+
+      - name: Prepare Release Directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+          
+          Copy-Item "target/release/lemonstudio.exe" -Destination "release/"
+          
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "release/" }
+          if (Test-Path "README.md") { Copy-Item "README.md" -Destination "release/" }
+          if (Test-Path "THIRD-PARTY-NOTICES.txt") { Copy-Item "THIRD-PARTY-NOTICES.txt" -Destination "release/" }
+          
+          if (Test-Path "target/bundled") {
+            Copy-Item -Path "target/bundled/*" -Destination "release/" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Compress Release Archive
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "release\*" -DestinationPath "Lemon-Studio-windows-x64.zip"
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lemon-Studio-windows-x64
+          path: Lemon-Studio-windows-x64.zip
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # <-- INI ADALAH PERBAIKAN UTAMA (Memberi izin menulis ke Release/Tag)
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: LemonStudio ${{ inputs.tag || github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: dist/*
