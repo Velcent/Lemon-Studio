@@ -1,4 +1,5 @@
 name: Release Windows x64
+
 on:
   push:
     tags:
@@ -9,6 +10,7 @@ on:
         description: 'Nama tag untuk rilis (contoh: v1.0.0). Kosongkan jika ingin menggunakan commit hash.'
         required: false
         default: ''
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
@@ -23,33 +25,66 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+
       - name: Cache Cargo registry and build
         uses: Swatinem/rust-cache@v2
-      - name: Build Lemon Studio (os-app)
-        run: cargo build -p os-app --release --locked
+
+      # Helper 32-bit untuk hosting VST2 32-bit; di-embed ke exe lewat LEMON_BRIDGE32.
+      - name: Build 32-bit VST2 bridge
+        run: cargo build -p os-vst2-bridge --bin lemonstudio-bridge32 --release --locked --target i686-pc-windows-msvc
+
+      - name: Set release environment
+        shell: pwsh
+        run: |
+          $tag = '${{ inputs.tag }}'
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = '${{ github.ref_name }}' }
+          $version = $tag -replace '^v', ''
+          if ($version -match '^\d+\.\d+\.\d+$') {
+            "LEMON_VERSION=$version" >> $env:GITHUB_ENV
+          }
+          "LEMON_CHANNEL=stable" >> $env:GITHUB_ENV
+          # build.rs os-vst2 jalan dari folder crate-nya, jadi harus path absolut:
+          $bridge = (Resolve-Path "target/i686-pc-windows-msvc/release/lemonstudio-bridge32.exe").Path
+          "LEMON_BRIDGE32=$bridge" >> $env:GITHUB_ENV
+
+      # FIX UTAMA: lemonstudio.exe dihasilkan crate `lemonstudio`, bukan `os-app`
+      # (os-app cuma library, tidak punya target bin).
+      - name: Build Lemon Studio (lemonstudio)
+        run: cargo build -p lemonstudio --release --locked
+
       - name: Bundle Plugins
         run: cargo run -p bundle-plugins --release --locked
+
       - name: Prepare Release Directory
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release
-          
-          Copy-Item "target/release/lemonstudio.exe" -Destination "release/"
-          
-          if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "release/" }
-          if (Test-Path "README.md") { Copy-Item "README.md" -Destination "release/" }
-          if (Test-Path "THIRD-PARTY-NOTICES.txt") { Copy-Item "THIRD-PARTY-NOTICES.txt" -Destination "release/" }
-          
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+
+          $exe = "target/release/lemonstudio.exe"
+          if (-not (Test-Path $exe)) {
+            Get-ChildItem "target/release" -Filter *.exe -ErrorAction SilentlyContinue
+            throw "lemonstudio.exe tidak ditemukan di target/release - build tidak menghasilkan binary."
+          }
+          Copy-Item $exe -Destination "release/"
+
+          foreach ($f in "LICENSE", "README.md", "THIRD-PARTY-NOTICES.txt") {
+            if (Test-Path $f) { Copy-Item $f -Destination "release/" }
+          }
+
           if (Test-Path "target/bundled") {
-            Copy-Item -Path "target/bundled/*" -Destination "release/" -Recurse -Force -ErrorAction SilentlyContinue
+            Copy-Item -Path "target/bundled/*" -Destination "release/" -Recurse -Force
           }
 
       - name: Compress Release Archive
         shell: pwsh
         run: |
           Compress-Archive -Path "release\*" -DestinationPath "Lemon-Studio-windows-x64.zip"
+
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -61,13 +96,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write # <-- INI ADALAH PERBAIKAN UTAMA (Memberi izin menulis ke Release/Tag)
+      contents: write
     steps:
       - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
